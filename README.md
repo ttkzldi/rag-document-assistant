@@ -147,3 +147,8 @@ No license has been specified yet. Add a license if you intend to permit others 
 ---
 
 **Built as a learning project exploring Retrieval-Augmented Generation, semantic search, vector databases, and local language models.**
+
+## Screenshots
+document-summary
+main-interface
+question-answer
