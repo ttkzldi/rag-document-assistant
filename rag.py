@@ -2,11 +2,10 @@
 from pathlib import Path
 import json
 import re
-import ollama
 
+import ollama
 import fitz
 import faiss
-import numpy as np
 from sentence_transformers import SentenceTransformer
 
 
@@ -17,6 +16,9 @@ METADATA_PATH = STORAGE_DIR / "metadata.json"
 
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 LLM_MODEL = "llama3.2:1b"
+
+# Maximum number of passages used for a document overview.
+OVERVIEW_MAX_CHUNKS = 24
 
 
 def chunk_text(text, chunk_size=180, overlap=40):
@@ -39,12 +41,32 @@ def chunk_text(text, chunk_size=180, overlap=40):
     return chunks
 
 
-def read_pdfs():
+def read_pdfs(pdf_names=None):
+    """Read all PDFs or only the specified PDF filenames."""
     records = []
-
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    for pdf_path in DATA_DIR.glob("*.pdf"):
+    if pdf_names is None:
+        pdf_paths = sorted(DATA_DIR.glob("*.pdf"))
+    else:
+        pdf_paths = []
+
+        for name in pdf_names:
+            safe_name = Path(name).name
+            pdf_path = DATA_DIR / safe_name
+
+            if (
+                pdf_path.is_file()
+                and pdf_path.suffix.lower() == ".pdf"
+            ):
+                pdf_paths.append(pdf_path)
+
+    if not pdf_paths:
+        raise ValueError(
+            "No matching PDF files were found in the data folder."
+        )
+
+    for pdf_path in pdf_paths:
         with fitz.open(pdf_path) as pdf:
             for page_num, page in enumerate(pdf, start=1):
                 text = re.sub(
@@ -61,13 +83,14 @@ def read_pdfs():
     return records
 
 
-def build_index():
-    records = read_pdfs()
+def build_index(pdf_names=None):
+    """Build a FAISS index from all PDFs or selected PDFs."""
+    records = read_pdfs(pdf_names=pdf_names)
 
     if not records:
         raise ValueError(
-            "No PDF text found. Put a PDF containing "
-            "selectable text inside the data folder."
+            "No readable PDF text was found. "
+            "Check whether the PDF contains selectable text."
         )
 
     print(f"Found {len(records)} text chunks.")
@@ -94,12 +117,16 @@ def build_index():
     )
 
     print(f"Success! Indexed {len(records)} chunks.")
+    print(
+        "Indexed PDFs:",
+        sorted(set(record["source"] for record in records))
+    )
 
 
 def load_index_and_records():
     if not INDEX_PATH.exists() or not METADATA_PATH.exists():
         raise FileNotFoundError(
-            "Index not found. Run: python rag.py build"
+            "Index not found. Upload and process a PDF first."
         )
 
     index = faiss.read_index(str(INDEX_PATH))
@@ -108,17 +135,18 @@ def load_index_and_records():
         METADATA_PATH.read_text(encoding="utf-8")
     )
 
-    if not records:
+    if not records or index.ntotal != len(records):
         raise ValueError(
-            "The document index is empty. Run the build command again."
+            "The index and metadata do not match. "
+            "Please process the PDF again."
         )
 
     return index, records
 
 
 def search_documents(question, top_k=4):
+    """Print the most relevant passages for a question."""
     index, records = load_index_and_records()
-
     model = SentenceTransformer(MODEL_NAME)
 
     query_embedding = model.encode(
@@ -150,54 +178,185 @@ def search_documents(question, top_k=4):
         print("No relevant document passages were found.")
 
 
+def is_overview_question(question):
+    """Identify questions asking for a broad document summary."""
+    text = question.lower().strip()
+    text = re.sub(r"[?!.,]+$", "", text)
+
+    patterns = [
+        r"\bwhat is this document about\b",
+        r"\bwhat is the document about\b",
+        r"\bwhat is this pdf about\b",
+        r"\bwhat is the pdf about\b",
+        r"\bsummarize this document\b",
+        r"\bsummarise this document\b",
+        r"\bsummarize the document\b",
+        r"\bsummarise the document\b",
+        r"\bgive me (?:an )?overview of (?:this )?(?:document|pdf)\b",
+        r"\bprovide (?:an )?overview of (?:this )?(?:document|pdf)\b",
+        r"\bdescribe the contents of (?:this )?(?:document|pdf)\b",
+        r"\bmain topics (?:of|in) (?:this )?(?:document|pdf)\b",
+    ]
+
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def select_overview_records(records, max_chunks=OVERVIEW_MAX_CHUNKS):
+    """
+    Select passages spread across the document.
+
+    If the document is short, use every passage. For a larger document,
+    sample evenly across the ordered passages to cover different regions.
+    """
+    total = len(records)
+
+    if total <= max_chunks:
+        return records
+
+    indices = [
+        round(i * (total - 1) / (max_chunks - 1))
+        for i in range(max_chunks)
+    ]
+
+    return [records[i] for i in indices]
+
+
 def ask_question(question, chat_history=None, top_k=4):
     index, records = load_index_and_records()
-
     model = SentenceTransformer(MODEL_NAME)
 
-    query_embedding = model.encode(
-        [question],
-        normalize_embeddings=True,
-        convert_to_numpy=True
-    ).astype("float32")
+    recent_messages = (chat_history or [])[-6:]
 
-    scores, indices = index.search(
-        query_embedding,
-        min(top_k, len(records))
+    history_text = "\n".join(
+        f"{message['role'].capitalize()}: {message['content']}"
+        for message in recent_messages
+        if message.get("role") in {"user", "assistant"}
     )
 
-    context_parts = []
-    sources = []
+    overview_question = is_overview_question(question)
 
-    for score, idx in zip(scores[0], indices[0]):
-        if idx < 0:
-            continue
+    if overview_question:
+        # Overview questions need broad document coverage, not just
+        # the passages most similar to the word "about".
+        selected_records = select_overview_records(records)
+        context_parts = [
+            (
+                f"Source: {item['source']}, Page: {item['page']}\n"
+                f"{item['text']}"
+            )
+            for item in selected_records
+        ]
 
-        item = records[int(idx)]
+        source_scores = {
+            (item["source"], item["page"]): None
+            for item in selected_records
+        }
 
-        context_parts.append(
-            f"Source: {item['source']}, "
-            f"Page: {item['page']}\n{item['text']}"
+        print(
+            f"Overview mode: using {len(selected_records)} "
+            f"passages from {len(records)} total passages."
         )
 
-        sources.append(
-            (item["source"], item["page"], float(score))
+    else:
+        # For specific questions, resolve follow-up references first.
+        rewrite_response = ollama.chat(
+            model=LLM_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Rewrite the latest user question as a standalone "
+                        "search query for retrieving passages from a PDF. "
+                        "Use conversation history only to resolve references "
+                        "such as 'it' and 'its'. Do not answer the question. "
+                        "Return only the rewritten query."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Conversation:\n"
+                        f"{history_text or 'No previous conversation.'}\n\n"
+                        f"Latest question: {question}"
+                    )
+                }
+            ]
         )
+
+        search_query = (
+            rewrite_response["message"]["content"].strip()
+            .strip("\"'")
+        )
+
+        if not search_query:
+            search_query = question
+
+        print(f"Original question: {question}")
+        print(f"Search query: {search_query}")
+
+        query_embedding = model.encode(
+            [search_query],
+            normalize_embeddings=True,
+            convert_to_numpy=True
+        ).astype("float32")
+
+        scores, indices = index.search(
+            query_embedding,
+            min(top_k, len(records))
+        )
+
+        context_parts = []
+        source_scores = {}
+
+        for score, idx in zip(scores[0], indices[0]):
+            if idx < 0:
+                continue
+
+            item = records[int(idx)]
+
+            context_parts.append(
+                f"Source: {item['source']}, "
+                f"Page: {item['page']}\n{item['text']}"
+            )
+
+            source_key = (item["source"], item["page"])
+            source_scores[source_key] = max(
+                source_scores.get(source_key, float("-inf")),
+                float(score)
+            )
 
     if not context_parts:
-        return "No relevant document passages were found."
+        return (
+            "I could not find enough information in the uploaded "
+            "document to answer that question."
+        )
 
     context = "\n\n".join(context_parts)
-        # Prepare recent conversation history for follow-up questions
-    history_text = ""
 
-    if chat_history:
-        recent_messages = chat_history[-6:]
-
-        history_text = "\n".join(
-            f"{message['role'].capitalize()}: {message['content']}"
-            for message in recent_messages
-            if message.get("role") in {"user", "assistant"}
+    if overview_question:
+        instructions = (
+            "You are a precise PDF question-answering assistant. "
+            "The user is asking for an overview of the document. "
+            "Summarize its overall purpose and the main topics, tasks, "
+            "or sections represented across the supplied passages. "
+            "Do not present one passage as the entire document. "
+            "The passages are sampled from across the document, so "
+            "be clear about the scope of what they support. "
+            "Do not invent a title, purpose, topic, or section that "
+            "the passages do not support. If the passages do not provide "
+            "enough information for a reliable overview, say so. "
+            "Use only the supplied document passages, not outside knowledge."
+        )
+    else:
+        instructions = (
+            "You are a precise PDF question-answering assistant. "
+            "Answer the current question using only information explicitly "
+            "supported by the supplied document passages. Do not use "
+            "outside knowledge to fill gaps. If the passages do not answer "
+            "the question, say: 'I could not find enough information in "
+            "the uploaded document to answer that question.' "
+            "Conversation history may help resolve references, but it is "
+            "not evidence. Do not invent facts or citations."
         )
 
     response = ollama.chat(
@@ -205,55 +364,38 @@ def ask_question(question, chat_history=None, top_k=4):
         messages=[
             {
                 "role": "system",
-                "content": (
-                     "You are a precise PDF question-answering assistant. "
-                    "Answer using only information explicitly supported "
-                    "by the supplied document context. "
-                    "Do not use outside knowledge to fill gaps. "
-                    "If the context does not answer the question, say: "
-                    "'I could not find enough information in the uploaded "
-                    "documents to answer that question.' "
-                    "Answer the exact question asked. "
-                    "For a simple definition, use 2 to 4 sentences. "
-                    "Avoid repetition, unnecessary lists, and unsupported claims. "
-                    "Do not claim that something appears in the document unless "
-                    "the supplied context supports that claim."
-                )
+                "content": instructions
             },
             {
                 "role": "user",
                 "content": (
-                    f"Recent conversation:\n"
+                    f"Recent conversation (for reference resolution only):\n"
                     f"{history_text or 'No previous conversation.'}\n\n"
-                    f"Document context:\n{context}\n\n"
+                    f"Document passages:\n{context}\n\n"
                     f"Current question: {question}\n\n"
-                    "Answer the current question using the document context. "
-                    "Use the conversation only to understand references "
-                    "such as 'it', 'that', or 'explain more'. "
-                    "Do not treat previous assistant answers as document "
-                    "evidence. If the document context does not support "
-                    "the answer, say you could not find enough information."
+                    "Answer the current question using the document "
+                    "passages above."
                 )
             }
         ]
     )
 
-    answer = response["message"]["content"]
+    answer = response["message"]["content"].strip()
 
-    # Remove duplicate source/page pairs.
-    unique_sources = list(dict.fromkeys(sources))
+    source_lines = []
+    for (source, page), score in source_scores.items():
+        if score is None:
+            source_lines.append(f"- {source}, page {page}")
+        else:
+            source_lines.append(
+                f"- {source}, page {page} "
+                f"(similarity: {score:.3f})"
+            )
 
-    source_lines = [
-        f"- {source}, page {page} "
-        f"(similarity: {score:.3f})"
-        for source, page, score in unique_sources
-    ]
+    if source_lines:
+        answer += "\n\n**Sources:**\n" + "\n".join(source_lines)
 
-    return (
-        answer
-        + "\n\n**Sources:**\n"
-        + "\n".join(source_lines)
-    )
+    return answer
 
 
 if __name__ == "__main__":
@@ -268,10 +410,7 @@ if __name__ == "__main__":
         choices=["build", "search", "ask"]
     )
 
-    parser.add_argument(
-        "--question",
-        type=str
-    )
+    parser.add_argument("--question", type=str)
 
     args = parser.parse_args()
 

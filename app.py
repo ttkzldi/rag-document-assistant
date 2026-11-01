@@ -139,6 +139,81 @@ st.markdown(
     hr {
         border-color: #d5deeb;
     }
+    
+/* Fix PDF uploader text and background */
+[data-testid="stFileUploader"] section,
+[data-testid="stFileUploader"] section > div {
+    background-color: #ffffff !important;
+    color: #172b4d !important;
+}
+
+[data-testid="stFileUploader"] label,
+[data-testid="stFileUploader"] small,
+[data-testid="stFileUploader"] span,
+[data-testid="stFileUploader"] button {
+    color: #172b4d !important;
+}
+
+[data-testid="stFileUploader"] button {
+    background-color: #eef3fb !important;
+    border: 1px solid #cbd5e1 !important;
+}
+
+/* Fix the bottom chat input */
+[data-testid="stChatInput"],
+[data-testid="stChatInput"] > div,
+[data-testid="stChatInput"] textarea {
+    background-color: #ffffff !important;
+    color: #172b4d !important;
+}
+
+[data-testid="stChatInput"] textarea {
+    -webkit-text-fill-color: #172b4d !important;
+    caret-color: #172b4d !important;
+}
+
+[data-testid="stChatInput"] textarea::placeholder {
+    color: #64748b !important;
+    -webkit-text-fill-color: #64748b !important;
+    opacity: 1 !important;
+}
+
+/* Keep the chat input border visible */
+[data-testid="stChatInput"] > div {
+    border: 1px solid #cbd5e1 !important;
+    border-radius: 12px !important;
+}
+
+/* Fix text in dark-themed buttons */
+[data-testid="stFileUploader"] button p {
+    color: #172b4d !important;
+}
+
+/* Force the PDF drop zone to use readable light colors */
+[data-testid="stFileUploaderDropzone"] {
+    background-color: #ffffff !important;
+    color: #172b4d !important;
+    border: 1px dashed #b8c7dc !important;
+}
+
+[data-testid="stFileUploaderDropzone"] * {
+    color: #172b4d !important;
+}
+
+[data-testid="stFileUploaderDropzone"] button {
+    background-color: #eef3fb !important;
+    color: #172b4d !important;
+    border: 1px solid #cbd5e1 !important;
+}
+
+[data-testid="stFileUploaderDropzone"] button * {
+    color: #172b4d !important;
+}
+
+[data-testid="stFileUploaderDropzone"] small {
+    color: #64748b !important;
+}
+
     </style>
     """,
     unsafe_allow_html=True,
@@ -208,7 +283,7 @@ with st.sidebar:
                 with st.spinner(
                     "Reading PDFs and building the search index..."
                 ):
-                    build_index()
+                        build_index(pdf_names=[safe_filename])
 
                 st.session_state.index_ready = True
                 st.session_state.processed_upload_hash = (
