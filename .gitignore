@@ -1,0 +1,33 @@
+# Python virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Generated vector index and metadata
+storage/index.faiss
+storage/metadata.json
+
+# Local PDF documents - avoid publishing private or copyrighted files
+data/*.pdf
+
+# Editor and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Test and coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
